@@ -1,0 +1,386 @@
+#!/bin/bash
+# BUnit - Bash Unit Testing Framework
+# version 0.1 - December 24, 2015
+#
+# @author Quentin Vandekerckhove
+
+trap 'bunit_shutdown_hook' EXIT ERR
+
+# Globales variables
+bunit_verbose=1
+bunit_tmp_file_prefix="bunit_"
+bunit_tmp_dir="$( mktemp -d bunit_XXXXX )"
+bunit_counter_ok=0
+bunit_counter_ko=0
+bunit_counter_ignore=0
+bunit_test_prefix="test_"
+bunit_ignore_test_prefix="ignore_test_"
+bunit_log_file=""
+bunit_output="${bunit_output-.}"
+bunit_always_exit_ok=1
+
+# Colors
+txtred='\e[0;31m' # Red
+txtgrn='\e[0;32m' # Green
+txtbrn='\e[0;33m' # Brown
+txtcyn='\e[0;36m' # Cyan
+txtrst='\e[0m'    # Text Reset
+
+# Check arguments
+bunit_test_class="${1##*/}"
+shift
+while [ "$1" != "" ]; do
+	case $1 in
+		-v)
+			bunit_verbose=0
+			;;
+		-o | --outputdir)
+			shift
+			bunit_output="$1"
+			;;
+		--ok)
+			bunit_always_exit_ok=0
+			;;
+	esac
+	shift
+done
+
+# Create a temporary file in the bunit temporary directory.
+# When using this function instead of 'mktemp' directly, BUnit will clean your
+# temporary files at the end of your test.
+bunit_mktemp() {
+	local template="$1"
+	if [[ $template == *"XXX"* || "$template" == "" ]]; then
+		mktemp -p $bunit_tmp_dir $template
+	else
+		echo "$bunit_tmp_dir/$template" 	
+	fi
+}
+
+bunit_report_location="$bunit_output/reports"
+bunit_surefire_reports_location="$bunit_output/surefire-reports"
+bunit_surefire_reports_test_suite="$bunit_surefire_reports_location/TEST-${bunit_test_class}.xml"
+bunit_surefire_reports_test_case=$( bunit_mktemp surefire_report_test_case.XXXXXXXXXX )
+bunit_stdin=$( bunit_mktemp stdin.XXXXXXXXXX )
+bunit_stderr=$( bunit_mktemp stderr.XXXXXXXXXX )
+bunit_log_assert=$( bunit_mktemp assert.XXXXXXXXXX )
+
+bunit_clean() {
+	rm -rf $bunit_tmp_dir
+}
+
+bunit_shutdown_hook() {
+	bunit_run_all_tests
+	on_shutdown
+	bunit_clean
+	if [ $bunit_always_exit_ok -eq 0 ]; then
+		exit 0
+	else
+		exit $bunit_counter_ko
+	fi
+}
+
+# user entry point to add action on shutdown
+on_shutdown() {
+	> /dev/null 
+}
+
+bunit_print_status() {
+	local status="$1"
+	local color="$txtgrn"
+	case $status in
+		OK) color="$txtgrn";;
+		KO) color="$txtred";;
+		IG) color="$txtbrn";;
+	esac
+	echo -e " [ ${color}$status${txtrst} ]" 
+}
+
+bunit_ok() {
+	(( bunit_counter_ok++ ))
+	bunit_print_status OK
+}
+
+bunit_ko() {
+	(( bunit_counter_ko++ ))
+	bunit_print_status KO
+}
+
+bunit_ignore() {
+	(( bunit_counter_ignore++ ))
+	bunit_print_status IG
+}
+
+bunit_print_output() {
+	if [ $bunit_verbose -eq 0 ] ; then
+		echo -e "assertions> ${txtred}"
+		cat $bunit_log_assert
+		echo -e "${txtbrn}stdin> "
+		cat $bunit_stdin
+		echo -e "${txtrst}"
+		echo -e "${txtred}stderr> "
+		cat $bunit_stderr
+		echo -e "${txtrst}"
+
+	fi
+}
+
+bunit_time_tracker_start() {
+	bunit_start_time=$(date +%s.%N)
+}
+
+bunit_time_tracker_stop() {
+	bunit_end_time=$(date +%s.%N)
+}
+
+bunit_time_tracker_duration() {
+	echo $( echo "$bunit_end_time - $bunit_start_time" | bc )
+}
+
+bunit_time_tracker_test_case_start() {
+	bunit_test_case_start_time=$(date +%s.%N)
+}
+
+bunit_time_tracker_test_case_stop() {
+	bunit_test_case_end_time=$(date +%s.%N)
+}
+
+bunit_time_tracker_test_case_duration() {
+	echo $( echo "$bunit_test_case_end_time - $bunit_test_case_start_time" | bc )
+}
+
+
+bunit_summary() {
+	local colors=${1-0}
+	local duration=$( bunit_time_tracker_duration )
+	if [ $colors -eq 0 ]; then
+		printf "Tests run: ${txtgrn}%d${txtrst}, Errors: ${txtred}%d${txtrst}, Skipped: ${txtbrn}%d${txtrst}, Time elapsed: %.3f sec\n" $bunit_counter_ok $bunit_counter_ko $bunit_counter_ignore $duration
+	else
+		printf "Tests run: %d, Errors: %d, Skipped: %d, Time elapsed: %.3f sec\n" $bunit_counter_ok $bunit_counter_ko $bunit_counter_ignore $duration
+	fi
+}
+
+bunit_surefire_reports_test_case() {
+	local test_name="$( bunit_test_name $1 )"
+	local test_status="$2"
+	local test_duration="$( bunit_time_tracker_test_case_duration )"
+	printf "\t<testcase name=\"%s\" classname=\"%s\" time=\"%.3f\"" "$test_name" "$bunit_test_class" "$test_duration" >> $bunit_surefire_reports_test_case
+	if [ $test_status -eq 0 ]; then
+		if bunit_test_skipped "$test_iter" ; then
+			printf ">\n\t\t<skipped message=\"%s\"/>\n" "" >> $bunit_surefire_reports_test_case
+			printf "\t</testcase>\n" >> $bunit_surefire_reports_test_case
+		else
+			printf "/>\n" >> $bunit_surefire_reports_test_case
+		fi
+	else
+		printf ">\n" >> $bunit_surefire_reports_test_case
+
+#		printf "\t\t<error message=\"%s\" type=\"%s\"><![CDATA[" "$(cat $bunit_log_assert)" "assertion" >> $bunit_surefire_reports_test_case
+#		cat $bunit_log_assert  >> $bunit_surefire_reports_test_case 
+#		printf "]]></error>\n" >> $bunit_surefire_reports_test_case
+		printf "\t\t<error message=\"%s\" type=\"%s\"/>\n" "$(cat $bunit_log_assert)" "assertion" >> $bunit_surefire_reports_test_case
+
+		if [ -s $bunit_stdin ]; then
+			printf "\t\t<system-out><![CDATA[" >> $bunit_surefire_reports_test_case
+			cat $bunit_stdin >> $bunit_surefire_reports_test_case
+			printf "]]></system-out>\n" >> $bunit_surefire_reports_test_case
+		fi
+		
+		if [ -s $bunit_stderr ]; then
+			printf "\t\t<system-err><![CDATA[" >> $bunit_surefire_reports_test_case
+			cat $bunit_stderr >> $bunit_surefire_reports_test_case
+			printf "]]></system-err>\n" >> $bunit_surefire_reports_test_case
+		fi
+
+		printf "\t</testcase>\n" >> $bunit_surefire_reports_test_case
+
+	fi
+}
+
+bunit_surefire_reports_suite() {
+	local duration=$( bunit_time_tracker_duration )
+	local nb_tests=$(( $bunit_counter_ok + $bunit_counter_ko + $bunit_counter_ignore ))
+	echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" > $bunit_surefire_reports_test_suite
+	printf "<testsuite package=\"%s\" name=\"%s\" time=\"%.3f\" tests=\"%d\" errors=\"%d\" skipped=\"%d\" failures=\"0\">\n" "$bunit_test_class" "$bunit_test_class" "$duration" "$nb_tests" "$bunit_counter_ko" "$bunit_counter_ignore" >> $bunit_surefire_reports_test_suite
+	printf "\t<properties/>\n" >> $bunit_surefire_reports_test_suite
+	cat $bunit_surefire_reports_test_case >> $bunit_surefire_reports_test_suite
+	echo "</testsuite>" >> $bunit_surefire_reports_test_suite
+#	echo "Reports generated in $bunit_surefire_reports_test_suite"
+}
+
+# Assertions
+assert_exit_status_success() {
+	local exit_code=$1
+	local valid=0
+	if [ ! $exit_code -eq 0 ]; then
+		valid=1
+		echo >> $bunit_log_assert "Expected return code 0 but was $exit_code"
+	fi
+	return $valid
+}
+
+assert_exit_status_failure() {
+	local exit_code=$1
+	local valid=0
+	report_exit_status $exit_code
+	if [ ! $exit_code -ne 0 ]; then
+		valid=1
+		echo >> $bunit_log_assert "Expected return code failure but was success ($exit_code)."
+	fi
+	return $valid
+}
+
+assert_contains() {
+	local file="$1"
+	local expected_string="$2"
+	[[ $(echo $(cat $file)) == *"$expected_string"* ]]
+	return $?
+}
+
+assert_stderr_contains() {
+	local expected_string="$1"
+	assert_contains "$bunit_stderr" "$expected_string"
+	local ret=$?
+	if [ $ret -ne 0 ]; then
+		echo >> $bunit_log_assert "stderr expected to contains: '$expected_string'"
+	fi
+	return $ret	
+}
+
+assert_stdin_contains() {
+	local expected_string="$1"
+	assert_contains "$bunit_stdin" "$expected_string" 
+	local ret=$?
+	if [ $ret -ne 0 ]; then
+		echo >> $bunit_log_assert "stdin expected to contains: '$expected_string'"
+	fi
+	return $ret	
+}
+
+assert_stderr_empty() {
+	if [ -s $bunit_stderr ]; then
+		echo >> $bunit_log_assert "stderr expected to be empty."
+		return 1
+	fi
+	return 0
+}
+
+assert_equals() {
+	local expected="$1"
+	local value="$2"
+	if [ "$expected" != "$value" ]; then
+		echo >> $bunit_log_assert "strings not equals: '$value' expected to be '$expected'." 
+		return 1
+	fi	
+	return 0
+}
+
+assert_true() {
+	$@
+	if [ $? -ne 0 ] ; then 
+		echo >> $bunit_log_assert "$@ is not true."
+		return 1
+	fi
+	return 0
+}
+
+### End assert
+
+bunit_test_skipped() {
+	local test_name="$1"
+	[[ $test_name == "$bunit_ignore_test_prefix"* ]]
+}
+
+bunit_test_name() {
+	local test_full_name="$1"
+	if bunit_test_skipped "$test_full_name" ; then
+		echo "${test_full_name#$bunit_ignore_test_prefix}"
+	else
+		echo "${test_full_name#$bunit_test_prefix}"
+	fi
+}
+
+bunit_run_all_tests() {
+	bunit_time_tracker_start
+	bunit_bunit_before_test_class
+	for test_iter in $(compgen -A command $bunit_test_prefix) $(compgen -A command $bunit_ignore_test_prefix) 
+	do
+		bunit_before_test "$test_iter"
+		if bunit_test_skipped "$test_iter" ; then
+			printf "${txtcyn}%-80s${txtrst}" "$( bunit_test_name $test_iter )"
+			bunit_ignore
+		else
+			printf "${txtcyn}%-80s${txtrst}"  "$( bunit_test_name $test_iter )"
+			$test_iter
+			local test_ret=$?
+		 	[ $test_ret -eq 0 ] && bunit_ok || bunit_ko
+			bunit_print_output 
+		fi
+		bunit_after_test "$test_iter" "$test_ret"
+	done
+	bunit_time_tracker_stop
+	bunit_after_test_class
+	bunit_summary
+}
+
+bunit_bunit_before_test_class() {
+	mkdir -p "$bunit_report_location" "$bunit_surefire_reports_location"
+	bunit_report_test_class="$bunit_report_location/$bunit_test_class.txt"
+	> "$bunit_report_test_class"	
+}
+
+bunit_after_test_class() {
+	bunit_summary >> "$bunit_report_test_class"
+	bunit_surefire_reports_suite
+}
+
+bunit_before_test() {
+	local test_name="$1"
+	bunit_test_name="$1"
+	bunit_time_tracker_test_case_start
+	# Clean files contents
+	> $bunit_stdin
+	> $bunit_stderr
+	> $bunit_log_assert
+	before_test
+}
+
+bunit_after_test() {
+	bunit_time_tracker_test_case_stop
+	local test_name="$1"
+	local test_ret="$2"
+	printf "Test: " >> $bunit_report_test_class
+	printf "${txtcyn}%-80s${txtrst}" "$test_name" >> $bunit_report_test_class
+	local status=$( [ $test_ret -eq 0 ] && echo "OK" || echo "KO" )
+	bunit_print_status $status >> $bunit_report_test_class
+	echo -e "Assertions:${txtred}" >> $bunit_report_test_class
+	cat $bunit_log_assert >> $bunit_report_test_class
+	echo -e "stdin:${txtbrn}" >> $bunit_report_test_class 
+	cat $bunit_stdin >> $bunit_report_test_class 
+	echo -e "stderr:${txtred}" >> $bunit_report_test_class 
+	cat $bunit_stderr >> $bunit_report_test_class 
+	echo -e "${txtrst}" >> $bunit_report_test_class 
+
+	bunit_surefire_reports_test_case "$test_name" "$test_ret" 
+	after_test
+}
+
+# overridable events
+after_test() {
+	> /dev/null
+}
+
+after_test_class() {
+	> /dev/null
+}
+
+
+before_test() {
+	> /dev/null
+}
+
+before_test_class() {
+	> /dev/null
+}
+
+

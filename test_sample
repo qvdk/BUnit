@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# Sample test to illustrate the usage of BUnit
+
+BUNIT_LOCATION="$( cd ${0%/*} && pwd )/bunit"
+
+. "$BUNIT_LOCATION" "$0" "$@"
+
+test_say_hello() {
+	echo "Hello" > $bunit_stdin 2> $bunit_stderr
+	assert_exit_status_success $? && assert_stdin_contains "Hello" && assert_stderr_empty
+}
+
+ignore_test_this_test_should_be_skipped() {
+	echo "This will not be executed"
+	blahblahblah
+}
+
+test_say_goodbye_should_failed() {
+	echo "Hello" > $bunit_stdin 2> $bunit_stderr
+	assert_exit_status_success $? && assert_stdin_contains "Goodbye" 
+}
+
+test_sample_assert_true() {
+	echo "1 2 3 4" | grep -c 3 > $bunit_stdin 2> $bunit_stderr
+	local count_three=$(echo $(cat $bunit_stdin) )
+	assert_exit_status_success $? && assert_true [ $count_three -eq 1 ] 
+}
